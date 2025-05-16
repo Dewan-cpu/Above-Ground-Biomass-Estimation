@@ -13,7 +13,7 @@ I. 2017 Pre-refugee Influx
 II. 2019 (early forest restoration) & 2023 (restoration progress)
 
 | Type                     | Code                                           | 
-| ------------- ---------  |:----------------------------------------------:| 
+| -------------------------|:----------------------------------------------:| 
 | Java Script for GEE      | AGB_Estimation_GEE.js                          | 
 
 Installation Instruction for Jupyter Environment:
