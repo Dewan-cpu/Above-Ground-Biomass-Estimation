@@ -1,0 +1,348 @@
+//Above Ground Biomass Estimation for the Post-Rohingya Refugee Influx Situation
+//The code is jointly updated by Dewan Mohammad Enamul Haque, Dewan Ruksana Ruma, and Mashfiqur Shattique
+// Original version of the code is aavailable at https://spatialthoughts.com/2024/02/07/agb-regression-gee/
+
+
+// ****************************************************
+// Part-1: Preprocessing and Data Preparation
+// ****************************************************
+
+// Select a region
+// ****************************************************
+Map.centerObject(roi);
+
+// Select the datasets
+var gedi = ee.ImageCollection('LARSE/GEDI/GEDI04_A_002_MONTHLY');
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var glo30 = ee.ImageCollection('COPERNICUS/DEM/GLO30');
+
+// Define your region of interest ///
+var geometry = roi; // Using roi as the region of interest
+
+// Preparing Sentinel-2 composite
+// For the year 2023, just change the date accordingly
+var filteredS2 = s2
+  .filter(ee.Filter.date('2019-01-01', '2019-12-31'))
+  .filter(ee.Filter.bounds(geometry));
+
+var s2Projection = ee.Image(filteredS2.first()).select('B4').projection();
+var scaleBands = function(image) {
+  return image.multiply(0.0001).copyProperties(image, ['system:time_start']);
+};
+
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var csPlusBands = csPlus.first().bandNames();
+
+function maskLowQA(image) {
+  var qaBand = 'cs';
+  var clearThreshold = 0.5;
+  var mask = image.select(qaBand).gte(clearThreshold);
+  return image.updateMask(mask);
+}
+
+var addIndices = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename('mndwi');
+  var ndbi = image.normalizedDifference(['B11', 'B8']).rename('ndbi');
+  var evi = image.expression(
+    '2.5 * ((NIR - RED)/(NIR + 6*RED - 7.5*BLUE + 1))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4'),
+      'BLUE': image.select('B2')
+    }).rename('evi');
+  var bsi = image.expression(
+      '(( X + Y ) - (A + B)) /(( X + Y ) + (A + B)) ', {
+        'X': image.select('B11'),
+        'Y': image.select('B4'),
+        'A': image.select('B8'),
+        'B': image.select('B2'),
+    }).rename('bsi');
+  
+  return image
+    .addBands(ndvi)
+    .addBands(mndwi)
+    .addBands(ndbi)
+    .addBands(evi)
+    .addBands(bsi);
+};
+
+var filteredS2WithCs = filteredS2.linkCollection(csPlus, csPlusBands);
+var s2Processed = filteredS2WithCs
+  .map(maskLowQA)
+  .select('B.*')
+  .map(scaleBands)
+  .map(addIndices);
+
+// Create the S2 composite
+var s2Composite = s2Processed.median().setDefaultProjection(s2Projection);
+
+// Preparing GLO-30 slope and elevation
+var glo30Filtered = glo30
+  .filter(ee.Filter.bounds(geometry))
+  .select('DEM');
+
+var demProj = glo30Filtered.first().select(0).projection();
+var elevation = glo30Filtered.mosaic().rename('dem').setDefaultProjection(demProj);
+var slope = ee.Terrain.slope(elevation);
+var demBands = elevation.addBands(slope);
+
+// Preparing GEDI L4A Mosaic
+var qualityMask = function(image) {
+  return image.updateMask(image.select('l4_quality_flag').eq(1))
+      .updateMask(image.select('degrade_flag').eq(0));
+};
+
+var errorMask = function(image) {
+  var relative_se = image.select('agbd_se').divide(image.select('agbd'));
+  return image.updateMask(relative_se.lte(0.5));
+};
+
+var slopeMask = function(image) {
+  return image.updateMask(slope.lt(30));
+};
+// Channge year for 2023
+var gediFiltered = gedi
+  .filter(ee.Filter.date('2019-01-01', '2019-12-31'))
+  .filter(ee.Filter.bounds(geometry));
+
+var gediProjection = ee.Image(gediFiltered.first()).select('agbd').projection();
+var gediProcessed = gediFiltered
+  .map(qualityMask)
+  .map(errorMask)
+  .map(slopeMask);
+
+var gediMosaic = gediProcessed.mosaic().select('agbd').setDefaultProjection(gediProjection);
+
+// ****************************************************
+// Part-2: Building a Regression Model
+// ****************************************************
+
+// Construct the stacked image
+var stacked = s2Composite.addBands(demBands).addBands(gediMosaic);
+var gridScale = 20;
+var gridProjection = ee.Projection('EPSG:32646').atScale(gridScale);
+
+var stacked = stacked.resample('bilinear');
+
+var stackedResampled = stacked
+  .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 1024})
+  .reproject({crs: gridProjection});
+
+stackedResampled = stackedResampled.updateMask(stackedResampled.mask().gt(0));
+
+// Extract Training Features
+var predictors = s2Composite.bandNames().cat(demBands.bandNames());
+var predicted = gediMosaic.bandNames().get(0);
+var predictedImage = stackedResampled.select([predicted]);
+
+var classMask = predictedImage.mask().toInt().rename('class');
+var numSamples = 1000;
+
+var training = stackedResampled.addBands(classMask)
+  .stratifiedSample({
+    numPoints: numSamples,
+    classBand: 'class',
+    region: geometry,
+    scale: gridScale,
+    classValues: [0, 1],
+    classPoints: [0, numSamples],
+    dropNulls: true,
+    tileScale: 16,
+});
+
+print('Number of Features Extracted', training.size()) ; 
+print('Sample Training Feature', training.first());
+
+// Train a Regression Model
+var model = ee.Classifier.smileRandomForest(100)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: training,
+    classProperty: predicted,
+    inputProperties: predictors
+  });
+  
+// Get model's predictions for training samples
+var predicted = training.classify({
+  classifier: model,
+  outputName: 'agbd_predicted'
+});
+
+// Calculate RMSE
+var calculateRmse = function(input) {
+    var observed = ee.Array(
+      input.aggregate_array('agbd'));
+    var predicted = ee.Array(
+      input.aggregate_array('agbd_predicted'));
+      
+    var rmse = observed.subtract(predicted).pow(2)
+      .reduce('mean', [0]).sqrt().get([0]);
+    return rmse;
+};
+var rmse = calculateRmse(predicted);
+print('RMSE', rmse);
+
+// Create a plot of observed vs. predicted values
+var chart = ui.Chart.feature.byFeature({
+  features: predicted.select(['agbd', 'agbd_predicted']),
+  xProperty: 'agbd',
+  yProperties: ['agbd_predicted'],
+}).setChartType('ScatterChart')
+  .setOptions({
+    title: 'Aboveground Biomass Density (Mg/Ha)',
+    dataOpacity: 0.8,
+    hAxis: {'title': 'Observed'},
+    vAxis: {'title': 'Predicted'},
+    legend: {position: 'right'},
+    series: {
+      0: {
+        visibleInLegend: false,
+        color: '#525252',
+        pointSize: 3,
+        pointShape: 'triangle',
+      },
+    },
+    trendlines: {
+      0: {
+        type: 'linear', 
+        color: 'black', 
+        lineWidth: 1,
+        pointSize: 0,
+        labelInLegend: 'Linear Fit',
+        visibleInLegend: true,
+        showR2: true
+      }
+    },
+    chartArea: {left: 100, bottom:100, width:'50%'},
+
+});
+print(chart);
+
+
+// Function to calculate R-squared
+var calculateRSquared = function(input) {
+  // Get observed and predicted values as arrays
+  var observed = ee.Array(input.aggregate_array('agbd'));
+  var predicted = ee.Array(input.aggregate_array('agbd_predicted'));
+
+  // Calculate mean of observed values
+  var observedMean = observed.reduce('mean', [0]).get([0]);
+
+  // Calculate sum of squared differences between observed and predicted
+  var ssr = observed.subtract(predicted).pow(2).reduce('sum', [0]).get([0]);
+
+  // Calculate sum of squared differences between observed and mean
+  var sst = observed.subtract(observedMean).pow(2).reduce('sum', [0]).get([0]);
+
+  // Calculate R-squared
+  var rSquared = ee.Number(1).subtract(ssr.divide(sst));
+
+  return rSquared;
+};
+
+// Calculate R-squared
+var rSquared = calculateRSquared(predicted);
+print('R-squared', rSquared);
+
+
+// Generate Predictions for Unknown Values
+var predictedImage = stackedResampled.classify({
+  classifier: model,
+  outputName: 'agbd'
+});
+
+
+// Calculate MAE
+var calculateMae = function(input) {
+  var observed = ee.Array(input.aggregate_array('agbd'));
+  var predicted = ee.Array(input.aggregate_array('agbd_predicted'));
+  
+  var mae = observed.subtract(predicted).abs()
+    .reduce('mean', [0]).get([0]);
+  return mae;
+};
+var mae = calculateMae(predicted);
+print('MAE:', mae);
+
+// Create a plot of observed vs. predicted values
+var chart = ui.Chart.feature.byFeature({
+  features: predicted.select(['agbd', 'agbd_predicted']),
+  xProperty: 'agbd',
+  yProperties: ['agbd_predicted'],
+}).setChartType('ScatterChart')
+  .setOptions({
+    title: 'Aboveground Biomass Density (Mg/Ha)',
+    dataOpacity: 0.8,
+    hAxis: {'title': 'Observed'},
+    vAxis: {'title': 'Predicted'},
+    legend: {position: 'right'},
+    series: {
+      0: {
+        visibleInLegend: false,
+        color: '#525252',
+        pointSize: 3,
+        pointShape: 'triangle',
+      },
+    },
+    trendlines: {
+      0: {
+        type: 'linear', 
+        color: 'black', 
+        lineWidth: 1,
+        pointSize: 0,
+        labelInLegend: 'Linear Fit',
+        visibleInLegend: true,
+        showR2: true
+      }
+    },
+    chartArea: {left: 100, bottom:100, width:'50%'},
+});
+print(chart);
+
+
+
+// ****************************************************
+// Part-3: Estimation of Total Biomass
+// ****************************************************
+
+// Mask Non-Vegetation Areas using ESA WorldCover
+var worldcover = ee.ImageCollection('ESA/WorldCover/v200').first();
+var worldcoverResampled = worldcover
+  .reduceResolution({reducer: ee.Reducer.mode(), maxPixels: 1024})
+  .reproject({crs: gridProjection});
+
+var landCoverMask = worldcoverResampled.eq(10)
+    .or(worldcoverResampled.eq(20))
+    .or(worldcoverResampled.eq(30))
+    .or(worldcoverResampled.eq(40))
+    .or(worldcoverResampled.eq(95));
+
+var predictedImageMasked = predictedImage.updateMask(landCoverMask);
+
+// Calculate Total AGB
+var pixelAreaHa = ee.Image.pixelArea().divide(10000);
+var predictedAgb = predictedImageMasked.multiply(pixelAreaHa);
+
+var stats = predictedAgb.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: gridScale,
+  maxPixels: 1e10,
+  tileScale: 16
+});
+
+var totalAgb = stats.getNumber('agbd');
+print('Total AGB (Mg)', totalAgb);
+
+// ****************************************************
+// Export the Final Predicted Above-Ground Biomass (AGB) Map
+// ****************************************************
+var exportPath = 'users/dewandsm/GEEAnalysis/';
+Export.image.toAsset({
+  image: predictedAgb.clip(roi),
+  description: 'Final_Predicted_AGB_Map',
+  assetId: exportPath + 'final_predicted_agb_map',
+  region: roi,
+  scale: gridScale,
+  maxPixels: 1e10
+});
