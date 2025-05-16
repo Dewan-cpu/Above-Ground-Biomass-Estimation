@@ -2,7 +2,8 @@
 Last modified: 15 May 2025.
 
 
-The codes have been implemented using Jupyter Hub and Google Earth Engine. The codes are jointly updated by Dewan Mohammad Enamul Haque, Dewan Ruksana Ruma, and Mashfiqur Shattique
+The codes have been implemented using Jupyter Hub and Google Earth Engine. The codes are jointly updated by Dewan Mohammad Enamul Haque, Dewan Ruksana Ruma, and Mashfiqur Shattique.
+
 Leveraging Sentinel 2A imagery, GEDI LiDAR biomass data, and ESA’s Biomass products, we estimated AGB for three key periods: 2017 (pre-refugee influx), 2019 (early forest restoration), and 2023 (restoration progress). We employed machine learning regression models, including Random Forest (RF), Support Vector Machine (SVM), and Gradient Boosting (XGBoost) regression. 
 
 I. 2017 Pre-refugee Influx
