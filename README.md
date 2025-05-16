@@ -9,12 +9,17 @@ I. 2017 Pre-refugee Influx
 | Type              | Code                                           | 
 | ------------------|:----------------------------------------------:| 
 | Python Script     | PY02_agb_ForestBiomass_Sentinel2-Updated.ipynb | 
- 
+
+The original code is available at https://eo4society.esa.int/resources/copernicus-rus-training-materials/
+
+
 II. 2019 (early forest restoration) & 2023 (restoration progress)
 
 | Type                     | Code                                           | 
 | -------------------------|:----------------------------------------------:| 
 | Java Script for GEE      | AGB_Estimation_GEE.js                          | 
+
+Original version of the code is aavailable at https://spatialthoughts.com/2024/02/07/agb-regression-gee/
 
 Installation Instruction for Jupyter Environment:
 A .yml file is provided in order to create a Python environment using conda. This environment can be created by running:
